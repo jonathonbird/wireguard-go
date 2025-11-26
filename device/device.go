@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
+ * Handshake-only Device implementation for stripped WireGuard engine.
+ * Derived from upstream wireguard-go/device.go with all TUN, data-path,
+ * timers, ratelimiter, and cookie machinery removed.
  */
 
 package device
@@ -9,42 +11,24 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/ratelimiter"
-	"golang.zx2c4.com/wireguard/rwcancel"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
 type Device struct {
 	state struct {
 		// state holds the device's state. It is accessed atomically.
-		// Use the device.deviceState method to read it.
-		// device.deviceState does not acquire the mutex, so it captures only a snapshot.
-		// During state transitions, the state variable is updated before the device itself.
-		// The state is thus either the current state of the device or
-		// the intended future state of the device.
-		// For example, while executing a call to Up, state will be deviceStateUp.
-		// There is no guarantee that that intended future state of the device
-		// will become the actual state; Up can fail.
-		// The device can also change state multiple times between time of check and time of use.
-		// Unsynchronized uses of state must therefore be advisory/best-effort only.
-		state atomic.Uint32 // actually a deviceState, but typed uint32 for convenience
-		// stopping blocks until all inputs to Device have been closed.
-		stopping sync.WaitGroup
-		// mu protects state changes.
+		// See deviceState docs below.
+		state atomic.Uint32
+		// mu protects state transitions.
 		sync.Mutex
 	}
 
 	net struct {
 		stopping sync.WaitGroup
 		sync.RWMutex
-		bind          conn.Bind // bind interface
-		netlinkCancel *rwcancel.RWCancel
-		port          uint16 // listening port
-		fwmark        uint32 // mark value (0 = disabled)
-		brokenRoaming bool
+		bind conn.Bind // UDP bind interface
+		port uint16    // listening port
 	}
 
 	staticIdentity struct {
@@ -58,14 +42,7 @@ type Device struct {
 		keyMap       map[NoisePublicKey]*Peer
 	}
 
-	rate struct {
-		underLoadUntil atomic.Int64
-		limiter        ratelimiter.Ratelimiter
-	}
-
-	allowedips    AllowedIPs
-	indexTable    IndexTable
-	cookieChecker CookieChecker
+	indexTable IndexTable
 
 	pool struct {
 		inboundElementsContainer  *WaitPool
@@ -76,19 +53,11 @@ type Device struct {
 	}
 
 	queue struct {
-		encryption *outboundQueue
-		decryption *inboundQueue
-		handshake  *handshakeQueue
+		handshake *handshakeQueue
 	}
 
-	tun struct {
-		device tun.Device
-		mtu    atomic.Int32
-	}
-
-	ipcMutex sync.RWMutex
-	closed   chan struct{}
-	log      *Logger
+	closed chan struct{}
+	log    *Logger
 }
 
 // deviceState represents the state of a Device.
@@ -100,39 +69,51 @@ type Device struct {
 //	  up -> closed
 type deviceState uint32
 
-//go:generate go run golang.org/x/tools/cmd/stringer -type deviceState -trimprefix=deviceState
 const (
 	deviceStateDown deviceState = iota
 	deviceStateUp
 	deviceStateClosed
 )
 
-// deviceState returns device.state.state as a deviceState
-// See those docs for how to interpret this value.
+// deviceState returns device.state.state as a deviceState.
 func (device *Device) deviceState() deviceState {
 	return deviceState(device.state.state.Load())
 }
 
 // isClosed reports whether the device is closed (or is closing).
-// See device.state.state comments for how to interpret this value.
 func (device *Device) isClosed() bool {
 	return device.deviceState() == deviceStateClosed
 }
 
 // isUp reports whether the device is up (or is attempting to come up).
-// See device.state.state comments for how to interpret this value.
 func (device *Device) isUp() bool {
 	return device.deviceState() == deviceStateUp
 }
 
-// Must hold device.peers.Lock()
-func removePeerLocked(device *Device, peer *Peer, key NoisePublicKey) {
-	// stop routing and processing of packets
-	device.allowedips.RemoveByPeer(peer)
-	peer.Stop()
+// NewDevice constructs a new handshake-only Device.
+// It does not know about TUN or any data path; only UDP bind and handshakes.
+func NewDevice(bind conn.Bind, logger *Logger) *Device {
+	device := new(Device)
+	device.state.state.Store(uint32(deviceStateDown))
+	device.closed = make(chan struct{})
+	device.log = logger
+	device.net.bind = bind
 
-	// remove from peer map
-	delete(device.peers.keyMap, key)
+	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
+	device.indexTable.Init()
+
+	device.PopulatePools()
+
+	// Create handshake queue.
+	device.queue.handshake = newHandshakeQueue()
+
+	// Start handshake workers.
+	cpus := runtime.NumCPU()
+	for i := 0; i < cpus; i++ {
+		go device.RoutineHandshake(i + 1)
+	}
+
+	return device
 }
 
 // changeState attempts to change the device state to match want.
@@ -142,7 +123,9 @@ func (device *Device) changeState(want deviceState) (err error) {
 	old := device.deviceState()
 	if old == deviceStateClosed {
 		// once closed, always closed
-		device.log.Verbosef("Interface closed, ignored requested state %s", want)
+		if device.log != nil {
+			device.log.Verbosef("Interface closed, ignored requested state %v", want)
+		}
 		return nil
 	}
 	switch want {
@@ -154,7 +137,7 @@ func (device *Device) changeState(want deviceState) (err error) {
 		if err == nil {
 			break
 		}
-		fallthrough // up failed; bring the device all the way back down
+		fallthrough // up failed; bring the device back down
 	case deviceStateDown:
 		device.state.state.Store(uint32(deviceStateDown))
 		errDown := device.downLocked()
@@ -162,73 +145,48 @@ func (device *Device) changeState(want deviceState) (err error) {
 			err = errDown
 		}
 	}
-	device.log.Verbosef("Interface state was %s, requested %s, now %s", old, want, device.deviceState())
+	if device.log != nil {
+		device.log.Verbosef("Interface state was %v, requested %v, now %v", old, want, device.deviceState())
+	}
 	return
 }
 
-// upLocked attempts to bring the device up and reports whether it succeeded.
+// upLocked attempts to bring the device up (open UDP bind and start receivers).
 // The caller must hold device.state.mu and is responsible for updating device.state.state.
 func (device *Device) upLocked() error {
 	if err := device.BindUpdate(); err != nil {
-		device.log.Errorf("Unable to update bind: %v", err)
+		if device.log != nil {
+			device.log.Errorf("Unable to update bind: %v", err)
+		}
 		return err
 	}
-
-	// The IPC set operation waits for peers to be created before calling Start() on them,
-	// so if there's a concurrent IPC set request happening, we should wait for it to complete.
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
-
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.Start()
-		if peer.persistentKeepaliveInterval.Load() > 0 {
-			peer.SendKeepalive()
-		}
-	}
-	device.peers.RUnlock()
 	return nil
 }
 
-// downLocked attempts to bring the device down.
+// downLocked attempts to bring the device down (close UDP bind).
 // The caller must hold device.state.mu and is responsible for updating device.state.state.
 func (device *Device) downLocked() error {
 	err := device.BindClose()
-	if err != nil {
+	if err != nil && device.log != nil {
 		device.log.Errorf("Bind close failed: %v", err)
 	}
-
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.Stop()
-	}
-	device.peers.RUnlock()
 	return err
 }
 
+// Up transitions the device to the "up" state (bind open, receivers running).
 func (device *Device) Up() error {
 	return device.changeState(deviceStateUp)
 }
 
+// Down transitions the device to the "down" state (bind closed, no receivers).
 func (device *Device) Down() error {
 	return device.changeState(deviceStateDown)
 }
 
-func (device *Device) IsUnderLoad() bool {
-	// check if currently under load
-	now := time.Now()
-	underLoad := len(device.queue.handshake.c) >= QueueHandshakeSize/8
-	if underLoad {
-		device.rate.underLoadUntil.Store(now.Add(UnderLoadAfterTime).UnixNano())
-		return true
-	}
-	// check if recently under load
-	return device.rate.underLoadUntil.Load() > now.UnixNano()
-}
-
+// SetPrivateKey sets the device's static private key and computes the
+// corresponding public key. In the handshake-only engine we keep this
+// simple and do not support changing the private key while peers exist.
 func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
-	// lock required resources
-
 	device.staticIdentity.Lock()
 	defer device.staticIdentity.Unlock()
 
@@ -236,106 +194,32 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 		return nil
 	}
 
-	device.peers.Lock()
-	defer device.peers.Unlock()
-
-	lockedPeers := make([]*Peer, 0, len(device.peers.keyMap))
-	for _, peer := range device.peers.keyMap {
-		peer.handshake.mutex.RLock()
-		lockedPeers = append(lockedPeers, peer)
+	device.peers.RLock()
+	defer device.peers.RUnlock()
+	if len(device.peers.keyMap) > 0 {
+		// For the testbed / handshake-only engine we don't implement
+		// the full peer rekey / expiration dance. Keep it explicit.
+		return ErrPrivateKeyChangeWithPeers
 	}
-
-	// remove peers with matching public keys
-
-	publicKey := sk.publicKey()
-	for key, peer := range device.peers.keyMap {
-		if peer.handshake.remoteStatic.Equals(publicKey) {
-			peer.handshake.mutex.RUnlock()
-			removePeerLocked(device, peer, key)
-			peer.handshake.mutex.RLock()
-		}
-	}
-
-	// update key material
 
 	device.staticIdentity.privateKey = sk
-	device.staticIdentity.publicKey = publicKey
-	device.cookieChecker.Init(publicKey)
-
-	// do static-static DH pre-computations
-
-	expiredPeers := make([]*Peer, 0, len(device.peers.keyMap))
-	for _, peer := range device.peers.keyMap {
-		handshake := &peer.handshake
-		handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(handshake.remoteStatic)
-		expiredPeers = append(expiredPeers, peer)
-	}
-
-	for _, peer := range lockedPeers {
-		peer.handshake.mutex.RUnlock()
-	}
-	for _, peer := range expiredPeers {
-		peer.ExpireCurrentKeypairs()
-	}
-
+	device.staticIdentity.publicKey = sk.publicKey()
 	return nil
 }
 
-func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
-	device := new(Device)
-	device.state.state.Store(uint32(deviceStateDown))
-	device.closed = make(chan struct{})
-	device.log = logger
-	device.net.bind = bind
-	device.tun.device = tunDevice
-	mtu, err := device.tun.device.MTU()
-	if err != nil {
-		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
-		mtu = DefaultMTU
-	}
-	device.tun.mtu.Store(int32(mtu))
-	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
-	device.rate.limiter.Init()
-	device.indexTable.Init()
+// ErrPrivateKeyChangeWithPeers is returned when attempting to change the
+// device's private key while peers already exist (unsupported in handshake-only mode).
+var ErrPrivateKeyChangeWithPeers = conn.ErrBindNotSupported // reuse a concrete error type is unnecessary; placeholder
 
-	device.PopulatePools()
-
-	// create queues
-
-	device.queue.handshake = newHandshakeQueue()
-	device.queue.encryption = newOutboundQueue()
-	device.queue.decryption = newInboundQueue()
-
-	// start workers
-
-	cpus := runtime.NumCPU()
-	device.state.stopping.Wait()
-	device.queue.encryption.wg.Add(cpus) // One for each RoutineHandshake
-	for i := 0; i < cpus; i++ {
-		go device.RoutineEncryption(i + 1)
-		go device.RoutineDecryption(i + 1)
-		go device.RoutineHandshake(i + 1)
-	}
-
-	device.state.stopping.Add(1)      // RoutineReadFromTUN
-	device.queue.encryption.wg.Add(1) // RoutineReadFromTUN
-	go device.RoutineReadFromTUN()
-	go device.RoutineTUNEventReader()
-
-	return device
-}
-
-// BatchSize returns the BatchSize for the device as a whole which is the max of
-// the bind batch size and the tun batch size. The batch size reported by device
-// is the size used to construct memory pools, and is the allowed batch size for
-// the lifetime of the device.
+// BatchSize returns the batch size for the device as a whole.
+// In the handshake-only engine this is just the bind's batch size.
 func (device *Device) BatchSize() int {
-	size := device.net.bind.BatchSize()
-	dSize := device.tun.device.BatchSize()
-	if size < dSize {
-		size = dSize
+	device.net.RLock()
+	defer device.net.RUnlock()
+	if device.net.bind == nil {
+		return 1
 	}
-	return size
+	return device.net.bind.BatchSize()
 }
 
 func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
@@ -348,54 +232,44 @@ func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 func (device *Device) RemovePeer(key NoisePublicKey) {
 	device.peers.Lock()
 	defer device.peers.Unlock()
-	// stop peer and remove from routing
 
-	peer, ok := device.peers.keyMap[key]
-	if ok {
-		removePeerLocked(device, peer, key)
-	}
+	delete(device.peers.keyMap, key)
 }
 
 func (device *Device) RemoveAllPeers() {
 	device.peers.Lock()
 	defer device.peers.Unlock()
 
-	for key, peer := range device.peers.keyMap {
-		removePeerLocked(device, peer, key)
-	}
-
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 }
 
+// Close shuts down the device: closes the UDP bind, stops receivers,
+// closes the handshake queue, and drops all peers.
 func (device *Device) Close() {
 	device.state.Lock()
 	defer device.state.Unlock()
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
+
 	if device.isClosed() {
 		return
 	}
 	device.state.state.Store(uint32(deviceStateClosed))
-	device.log.Verbosef("Device closing")
+	if device.log != nil {
+		device.log.Verbosef("Device closing")
+	}
 
-	device.tun.device.Close()
-	device.downLocked()
+	// Close UDP bind and wait for receive goroutines to stop.
+	device.BindClose()
 
-	// Remove peers before closing queues,
-	// because peers assume that queues are active.
+	// Remove peers.
 	device.RemoveAllPeers()
 
-	// We kept a reference to the encryption and decryption queues,
-	// in case we started any new peers that might write to them.
-	// No new peers are coming; we are done with these queues.
-	device.queue.encryption.wg.Done()
-	device.queue.decryption.wg.Done()
+	// Drop the initial reference on the handshake queue so it can close
+	// once all receiver goroutines have exited.
 	device.queue.handshake.wg.Done()
-	device.state.stopping.Wait()
 
-	device.rate.limiter.Close()
-
-	device.log.Verbosef("Device closed")
+	if device.log != nil {
+		device.log.Verbosef("Device closed")
+	}
 	close(device.closed)
 }
 
@@ -403,31 +277,11 @@ func (device *Device) Wait() chan struct{} {
 	return device.closed
 }
 
-func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
-	if !device.isUp() {
-		return
-	}
-
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.keypairs.RLock()
-		sendKeepalive := peer.keypairs.current != nil && !peer.keypairs.current.created.Add(RejectAfterTime).Before(time.Now())
-		peer.keypairs.RUnlock()
-		if sendKeepalive {
-			peer.SendKeepalive()
-		}
-	}
-	device.peers.RUnlock()
-}
-
 // closeBindLocked closes the device's net.bind.
 // The caller must hold the net mutex.
 func closeBindLocked(device *Device) error {
 	var err error
 	netc := &device.net
-	if netc.netlinkCancel != nil {
-		netc.netlinkCancel.Cancel()
-	}
 	if netc.bind != nil {
 		err = netc.bind.Close()
 	}
@@ -435,39 +289,15 @@ func closeBindLocked(device *Device) error {
 	return err
 }
 
+// Bind returns the current UDP bind.
 func (device *Device) Bind() conn.Bind {
-	device.net.Lock()
-	defer device.net.Unlock()
+	device.net.RLock()
+	defer device.net.RUnlock()
 	return device.net.bind
 }
 
-func (device *Device) BindSetMark(mark uint32) error {
-	device.net.Lock()
-	defer device.net.Unlock()
-
-	// check if modified
-	if device.net.fwmark == mark {
-		return nil
-	}
-
-	// update fwmark on existing bind
-	device.net.fwmark = mark
-	if device.isUp() && device.net.bind != nil {
-		if err := device.net.bind.SetMark(mark); err != nil {
-			return err
-		}
-	}
-
-	// clear cached source addresses
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.markEndpointSrcForClearing()
-	}
-	device.peers.RUnlock()
-
-	return nil
-}
-
+// BindUpdate closes any existing sockets and, if the device is up,
+// re-opens the bind and starts receive goroutines.
 func (device *Device) BindUpdate() error {
 	device.net.Lock()
 	defer device.net.Unlock()
@@ -477,15 +307,16 @@ func (device *Device) BindUpdate() error {
 		return err
 	}
 
-	// open new sockets
-	if !device.isUp() {
+	// open new sockets only if device is up
+	if !device.isUp() || device.net.bind == nil {
 		return nil
 	}
 
-	// bind to new port
-	var err error
-	var recvFns []conn.ReceiveFunc
-	netc := &device.net
+	var (
+		err     error
+		recvFns []conn.ReceiveFunc
+		netc    = &device.net
+	)
 
 	recvFns, netc.port, err = netc.bind.Open(netc.port)
 	if err != nil {
@@ -493,41 +324,22 @@ func (device *Device) BindUpdate() error {
 		return err
 	}
 
-	netc.netlinkCancel, err = device.startRouteListener(netc.bind)
-	if err != nil {
-		netc.bind.Close()
-		netc.port = 0
-		return err
-	}
-
-	// set fwmark
-	if netc.fwmark != 0 {
-		err = netc.bind.SetMark(netc.fwmark)
-		if err != nil {
-			return err
-		}
-	}
-
-	// clear cached source addresses
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.markEndpointSrcForClearing()
-	}
-	device.peers.RUnlock()
-
 	// start receiving routines
 	device.net.stopping.Add(len(recvFns))
-	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
-	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
+	device.queue.handshake.wg.Add(len(recvFns)) // each RoutineReceiveIncoming writes to device.queue.handshake
 	batchSize := netc.bind.BatchSize()
 	for _, fn := range recvFns {
 		go device.RoutineReceiveIncoming(batchSize, fn)
 	}
 
-	device.log.Verbosef("UDP bind has been updated")
+	if device.log != nil {
+		device.log.Verbosef("UDP bind has been updated")
+	}
 	return nil
 }
 
+// BindClose closes the current UDP bind and waits for all receive
+// goroutines to exit.
 func (device *Device) BindClose() error {
 	device.net.Lock()
 	err := closeBindLocked(device)

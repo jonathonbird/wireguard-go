@@ -209,20 +209,19 @@ func (msg *MessageCookieReply) marshal(b []byte) error {
 }
 
 type Handshake struct {
-	state                     handshakeState
-	mutex                     sync.RWMutex
-	hash                      [blake2s.Size]byte       // hash value
-	chainKey                  [blake2s.Size]byte       // chain key
-	presharedKey              NoisePresharedKey        // psk
-	localEphemeral            NoisePrivateKey          // ephemeral secret key
-	localIndex                uint32                   // used to clear hash-table
-	remoteIndex               uint32                   // index for sending
-	remoteStatic              NoisePublicKey           // long term key
-	remoteEphemeral           NoisePublicKey           // ephemeral public key
-	precomputedStaticStatic   [NoisePublicKeySize]byte // precomputed shared secret
-	lastTimestamp             tai64n.Timestamp
-	lastInitiationConsumption time.Time
-	lastSentHandshake         time.Time
+	state                   handshakeState
+	mutex                   sync.RWMutex
+	hash                    [blake2s.Size]byte       // hash value
+	chainKey                [blake2s.Size]byte       // chain key
+	presharedKey            NoisePresharedKey        // psk
+	localEphemeral          NoisePrivateKey          // ephemeral secret key
+	localIndex              uint32                   // used to clear hash-table
+	remoteIndex             uint32                   // index for sending
+	remoteStatic            NoisePublicKey           // long term key
+	remoteEphemeral         NoisePublicKey           // ephemeral public key
+	precomputedStaticStatic [NoisePublicKeySize]byte // precomputed shared secret
+	lastTimestamp           tai64n.Timestamp
+	lastSentHandshake       time.Time
 }
 
 var (
@@ -402,17 +401,12 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	}
 	mixHash(&hash, &hash, msg.Timestamp[:])
 
-	// protect against replay & flood
+	// protect against replay (no flood protection in testbed)
 
 	replay := !timestamp.After(handshake.lastTimestamp)
-	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
 	handshake.mutex.RUnlock()
 	if replay {
 		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
-		return nil
-	}
-	if flood {
-		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake flood", peer)
 		return nil
 	}
 
@@ -426,10 +420,6 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 	handshake.remoteEphemeral = msg.Ephemeral
 	if timestamp.After(handshake.lastTimestamp) {
 		handshake.lastTimestamp = timestamp
-	}
-	now := time.Now()
-	if now.After(handshake.lastInitiationConsumption) {
-		handshake.lastInitiationConsumption = now
 	}
 	handshake.state = handshakeInitiationConsumed
 
