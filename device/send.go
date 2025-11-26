@@ -7,60 +7,9 @@
 
 package device
 
-import (
-	"sync"
-	"time"
-)
-
-/*
- * Outbound element types
- *
- * We keep these because pools.go refers to QueueOutboundElement and
- * QueueOutboundElementsContainer. They are not used by the handshake-only
- * engine at the moment, but keeping them avoids invasive changes to pools.go.
- */
-
-type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption (unused in handshake-only)
-	keypair *Keypair              // keypair for encryption (unused in handshake-only)
-	peer    *Peer                 // related peer (unused in handshake-only)
-}
-
-type QueueOutboundElementsContainer struct {
-	sync.Mutex
-	elems []*QueueOutboundElement
-}
-
-// NewOutboundElement remains for compatibility with pools and potential
-// future use, but is not used by the handshake-only engine.
-func (device *Device) NewOutboundElement() *QueueOutboundElement {
-	elem := device.GetOutboundElement()
-	elem.buffer = device.GetMessageBuffer()
-	elem.nonce = 0
-	// keypair and peer were cleared (if necessary) by clearPointers.
-	return elem
-}
-
-// clearPointers clears elem fields that contain pointers. This is used by
-// PutOutboundElement in pools.go to help the GC.
-func (elem *QueueOutboundElement) clearPointers() {
-	elem.buffer = nil
-	elem.packet = nil
-	elem.keypair = nil
-	elem.peer = nil
-}
-
-/*
- * Handshake send primitives
- *
- * These are the only pieces actually used in the handshake-only engine.
- */
-
 // SendHandshakeInitiation creates and sends a Noise_IKpsk2 initiation message.
 // The isRetry flag is kept for API compatibility but has no special effect in
-// the handshake-only engine (we don't track handshakeAttempts or timers).
+// the handshake-only engine.
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	_ = isRetry // for API compatibility only
 
@@ -84,7 +33,6 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	}
 	return err
 }
-
 
 // SendHandshakeResponse creates, finalizes, and sends a Noise_IKpsk2
 // response message. It also calls BeginSymmetricSession so that the
@@ -116,4 +64,3 @@ func (peer *Peer) SendHandshakeResponse() error {
 	}
 	return err
 }
-

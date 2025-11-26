@@ -1,6 +1,5 @@
 package device
 
-import "time"
 
 const (
     // queue + buffers

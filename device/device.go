@@ -45,12 +45,9 @@ type Device struct {
 	indexTable IndexTable
 
 	pool struct {
-		inboundElementsContainer  *WaitPool
-		outboundElementsContainer *WaitPool
-		messageBuffers            *WaitPool
-		inboundElements           *WaitPool
-		outboundElements          *WaitPool
+		messageBuffers *WaitPool
 	}
+
 
 	queue struct {
 		handshake *handshakeQueue
