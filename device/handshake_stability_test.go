@@ -28,26 +28,26 @@ func setPeerEndpoint(peer *Peer, ep conn.Endpoint) {
 	peer.endpoint.Unlock()
 }
 
-func waitForHandshake(t *testing.T, aToB, bToA *Peer, timeout time.Duration) {
+// waitForNewHandshake waits until (a) the responder has sent one more response,
+// and (b) the initiator has rotated to a new current keypair (pointer changed).
+func waitForNewHandshake(t *testing.T, devResponder *Device, initiator *Peer, beforeKP *Keypair, beforeResponses uint64, timeout time.Duration) {
 	t.Helper()
+
 	ok := waitUntil(timeout, func() bool {
-		if aToB.keypairs.Current() == nil {
-			return false
-		}
-		return bToA.keypairs.next.Load() != nil || bToA.keypairs.Current() != nil
+		afterResponses := devResponder.Stats().ResponsesSentTotal
+		afterKP := initiator.keypairs.Current()
+		return afterResponses > beforeResponses && afterKP != nil && afterKP != beforeKP
 	})
+
 	if !ok {
-		t.Fatalf("handshake did not complete: A current=%v, B current=%v, B next=%v",
-			aToB.keypairs.Current() != nil,
-			bToA.keypairs.Current() != nil,
-			bToA.keypairs.next.Load() != nil,
-		)
+		after := devResponder.Stats()
+		cur := initiator.keypairs.Current()
+		t.Fatalf("handshake did not advance: responses before=%d after=%d, kp before=%p after=%p",
+			beforeResponses, after.ResponsesSentTotal, beforeKP, cur)
 	}
 }
 
 func TestHandshakeRepeatabilitySinglePair(t *testing.T) {
-	// This test repeatedly performs handshakes between one A/B pair,
-	// ensuring the engine remains stable and keeps producing fresh keypairs.
 	logger := NewLogger(LogLevelSilent, "(test) ")
 
 	bindA := conn.NewDefaultBind()
@@ -77,7 +77,7 @@ func TestHandshakeRepeatabilitySinglePair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("devA.NewPeer(pkB): %v", err)
 	}
-	peerBtoA, err := devB.NewPeer(skA.publicKey())
+	_, err = devB.NewPeer(skA.publicKey())
 	if err != nil {
 		t.Fatalf("devB.NewPeer(pkA): %v", err)
 	}
@@ -101,16 +101,15 @@ func TestHandshakeRepeatabilitySinglePair(t *testing.T) {
 
 	const rounds = 250
 
-	var lastLocalIndex uint32
-	var lastRemoteIndex uint32
-	var sawFirst bool
-
 	for i := 0; i < rounds; i++ {
+		beforeKP := peerAtoB.keypairs.Current()
+		beforeResponses := devB.Stats().ResponsesSentTotal
+
 		if err := peerAtoB.SendHandshakeInitiation(false); err != nil {
 			t.Fatalf("round %d SendHandshakeInitiation: %v", i, err)
 		}
 
-		waitForHandshake(t, peerAtoB, peerBtoA, 2*time.Second)
+		waitForNewHandshake(t, devB, peerAtoB, beforeKP, beforeResponses, 2*time.Second)
 
 		ka := peerAtoB.keypairs.Current()
 		if ka == nil {
@@ -119,36 +118,20 @@ func TestHandshakeRepeatabilitySinglePair(t *testing.T) {
 		if !ka.isInitiator {
 			t.Fatalf("round %d: expected A keypair isInitiator=true", i)
 		}
-
-		// Ensure keypairs progress (indices should typically change across handshakes).
-		// It’s theoretically possible to repeat by chance, but across 250 rounds it
-		// would be astronomically unlikely if NewIndexForHandshake is working.
-		if sawFirst {
-			if ka.localIndex == lastLocalIndex && ka.remoteIndex == lastRemoteIndex {
-				t.Fatalf("round %d: keypair indices did not change (local=%d remote=%d)", i, ka.localIndex, ka.remoteIndex)
-			}
-		}
-		lastLocalIndex = ka.localIndex
-		lastRemoteIndex = ka.remoteIndex
-		sawFirst = true
 	}
 
 	stA := devA.Stats()
 	stB := devB.Stats()
 
-	// Initiations should have been sent.
-	if stA.InitiationsSentTotal == 0 {
-		t.Fatalf("expected initiations sent > 0; got %+v", stA)
+	if stA.InitiationsSentTotal < rounds {
+		t.Fatalf("expected initiations sent >= %d; got %d (stats=%+v)", rounds, stA.InitiationsSentTotal, stA)
 	}
-	// Responder should have sent responses.
-	if stB.ResponsesSentTotal == 0 {
-		t.Fatalf("expected responses sent > 0; got %+v", stB)
+	if stB.ResponsesSentTotal < rounds {
+		t.Fatalf("expected responses sent >= %d; got %d (stats=%+v)", rounds, stB.ResponsesSentTotal, stB)
 	}
 }
 
 func TestHandshakeRepeatabilityParallelInitiations(t *testing.T) {
-	// Same A/B pair, but multiple goroutines initiating concurrently to shake out
-	// races in queueing/handshake state transitions.
 	logger := NewLogger(LogLevelSilent, "(test) ")
 
 	bindA := conn.NewDefaultBind()
@@ -178,7 +161,7 @@ func TestHandshakeRepeatabilityParallelInitiations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("devA.NewPeer(pkB): %v", err)
 	}
-	peerBtoA, err := devB.NewPeer(skA.publicKey())
+	_, err = devB.NewPeer(skA.publicKey())
 	if err != nil {
 		t.Fatalf("devB.NewPeer(pkA): %v", err)
 	}
@@ -190,7 +173,6 @@ func TestHandshakeRepeatabilityParallelInitiations(t *testing.T) {
 		t.Fatalf("devB.Up(): %v", err)
 	}
 
-	// Set A -> B endpoint once.
 	devB.net.RLock()
 	portB := devB.net.port
 	devB.net.RUnlock()
@@ -202,6 +184,9 @@ func TestHandshakeRepeatabilityParallelInitiations(t *testing.T) {
 
 	const goroutines = 8
 	const perG = 50
+
+	beforeKP := peerAtoB.keypairs.Current()
+	beforeResponses := devB.Stats().ResponsesSentTotal
 
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
@@ -215,8 +200,8 @@ func TestHandshakeRepeatabilityParallelInitiations(t *testing.T) {
 	}
 	wg.Wait()
 
-	// We just need at least one successful handshake completion.
-	waitForHandshake(t, peerAtoB, peerBtoA, 2*time.Second)
+	// At least one handshake must advance.
+	waitForNewHandshake(t, devB, peerAtoB, beforeKP, beforeResponses, 2*time.Second)
 
 	if peerAtoB.keypairs.Current() == nil {
 		t.Fatalf("expected A to have current keypair after parallel initiations")
