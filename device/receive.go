@@ -46,9 +46,14 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 	device.log.Verbosef("Routine: receive incoming %s - started", recvName)
 	defer func() {
 		device.log.Verbosef("Routine: receive incoming %s - stopped", recvName)
+
+		// This goroutine was counted in device.net.stopping.Add() in BindUpdate().
+		device.net.stopping.Done()
+
 		// One writer reference is released when this goroutine exits.
 		device.queue.handshake.wg.Done()
 	}()
+
 
 	// Pre-allocate buffers for batched receive.
 	var (
