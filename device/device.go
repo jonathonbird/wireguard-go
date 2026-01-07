@@ -13,7 +13,9 @@ import (
 	"sync/atomic"
 
 	"golang.zx2c4.com/wireguard/conn"
+	"errors"
 )
+
 
 type Device struct {
 	state struct {
@@ -206,7 +208,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 
 // ErrPrivateKeyChangeWithPeers is returned when attempting to change the
 // device's private key while peers already exist (unsupported in handshake-only mode).
-var ErrPrivateKeyChangeWithPeers = conn.ErrBindNotSupported // reuse a concrete error type is unnecessary; placeholder
+var ErrPrivateKeyChangeWithPeers = errors.New("cannot change private key while peers exist")
 
 // BatchSize returns the batch size for the device as a whole.
 // In the handshake-only engine this is just the bind's batch size.
