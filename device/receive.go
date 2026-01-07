@@ -218,8 +218,10 @@ func (device *Device) RoutineHandshake(id int) {
 			if err := msg.unmarshal(elem.packet); err != nil {
 				device.log.Errorf("Failed to decode response message: %v", err)
 				device.PutMessageBuffer(elem.buffer)
+				device.counters.decodeFailedTotal.Add(1)
 				continue
 			}
+
 
 			// Consume response → get Peer.
 			peer := device.ConsumeMessageResponse(&msg)
