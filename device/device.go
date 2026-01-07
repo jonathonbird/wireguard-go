@@ -50,6 +50,8 @@ type Device struct {
 		messageBuffers *WaitPool
 	}
 
+	counters deviceCounters
+
 
 	queue struct {
 		handshake *handshakeQueue

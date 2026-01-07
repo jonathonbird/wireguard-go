@@ -31,6 +31,9 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
 	}
+	if err == nil {
+		peer.device.counters.initiationsSentTotal.Add(1)
+	}
 	return err
 }
 

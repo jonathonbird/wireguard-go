@@ -102,7 +102,9 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 		// Handle each packet in the batch.
 		for i, size := range sizes[:count] {
+			device.counters.recvPacketsTotal.Add(1)
 			if size < MinMessageSize {
+				device.counters.dropBadSizeTotal.Add(1)
 				continue
 			}
 
@@ -113,18 +115,24 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 			case MessageInitiationType:
 				if len(packet) != MessageInitiationSize {
+					device.counters.dropBadSizeTotal.Add(1)
 					continue
 				}
+				device.counters.recvHandshakePacketsTotal.Add(1)
 
 			case MessageResponseType:
 				if len(packet) != MessageResponseSize {
+					device.counters.dropBadSizeTotal.Add(1)
 					continue
 				}
+				device.counters.recvHandshakePacketsTotal.Add(1)
+
 
 			default:
 				// We are a handshake-only engine: drop transport,
 				// cookie replies, and any unknown types.
 				device.log.Verbosef("Received non-handshake packet (type %d); dropping", msgType)
+				device.counters.dropBadTypeTotal.Add(1)
 				continue
 			}
 
@@ -137,10 +145,13 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				endpoint: endpoints[i],
 				buffer:   bufsArrs[i],
 			}:
+				device.counters.enqueueTotal.Add(1)
 				// Replace this slot with a fresh buffer from the pool.
 				bufsArrs[i] = device.GetMessageBuffer()
 				bufs[i] = bufsArrs[i][:]
+				
 			default:
+				device.counters.dropQueueFullTotal.Add(1)
 				// Handshake queue full: drop packet.
 			}
 		}
@@ -180,6 +191,7 @@ func (device *Device) RoutineHandshake(id int) {
 			if err := msg.unmarshal(elem.packet); err != nil {
 				device.log.Errorf("Failed to decode initiation message: %v", err)
 				device.PutMessageBuffer(elem.buffer)
+				device.counters.decodeFailedTotal.Add(1)
 				continue
 			}
 
@@ -188,6 +200,7 @@ func (device *Device) RoutineHandshake(id int) {
 			if peer == nil {
 				device.log.Verbosef("Received invalid initiation message from %s", elem.endpoint.DstToString())
 				device.PutMessageBuffer(elem.buffer)
+				device.counters.consumeInitiationFailedTotal.Add(1)
 				continue
 			}
 
@@ -197,7 +210,7 @@ func (device *Device) RoutineHandshake(id int) {
 
 			if err := peer.SendHandshakeResponse(); err != nil {
 				device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
-			}
+			} else { device.counters.responsesSentTotal.Add(1) }
 
 		case MessageResponseType:
 			// Unmarshal response.
@@ -213,6 +226,7 @@ func (device *Device) RoutineHandshake(id int) {
 			if peer == nil {
 				device.log.Verbosef("Received invalid response message from %s", elem.endpoint.DstToString())
 				device.PutMessageBuffer(elem.buffer)
+				device.counters.consumeResponseFailedTotal.Add(1)
 				continue
 			}
 
