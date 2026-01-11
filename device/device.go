@@ -76,6 +76,12 @@ const (
 	deviceStateClosed
 )
 
+func (device *Device) NetSetPortForTest(p uint16) {
+	device.net.Lock()
+	device.net.port = p
+	device.net.Unlock()
+}
+
 // deviceState returns device.state.state as a deviceState.
 func (device *Device) deviceState() deviceState {
 	return deviceState(device.state.state.Load())
