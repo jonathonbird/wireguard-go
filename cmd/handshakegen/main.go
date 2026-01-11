@@ -58,11 +58,10 @@ func main() {
 	makeDev := func(listenPort uint16) *device.Device {
 		b := conn.NewDefaultBind()
 		d := device.NewDevice(b, logger)
-		// Set listen port (bind.Open will use it)
-		dnet := &d // shorthand
-		dnet.NetSetPortForTest(listenPort) // see note below
+		d.NetSetPortForTest(listenPort)
 		return d
 	}
+
 
 	// NOTE:
 	// wireguard-go's Bind.Open takes the requested port from bind.Open(netc.port),
