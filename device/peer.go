@@ -130,3 +130,13 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	peer.endpoint.clearSrcOnTx = false
 	peer.endpoint.val = endpoint
 }
+
+// EndpointSetForTest sets the peer's endpoint (testbed helper).
+func (peer *Peer) EndpointSetForTest(ep conn.Endpoint) {
+	peer.endpoint.Lock()
+	peer.endpoint.val = ep
+	peer.endpoint.clearSrcOnTx = false
+	peer.endpoint.disableRoaming = false
+	peer.endpoint.Unlock()
+}
+

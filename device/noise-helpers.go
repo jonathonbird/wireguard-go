@@ -16,6 +16,8 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
+
+
 /* KDF related functions.
  * HMAC-based Key Derivation Function (HKDF)
  * https://tools.ietf.org/html/rfc5869
@@ -106,3 +108,10 @@ func (sk *NoisePrivateKey) sharedSecret(pk NoisePublicKey) (ss [NoisePublicKeySi
 	}
 	return ss, nil
 }
+
+// NewPrivateKeyForTest is an exported wrapper for generating a Noise private key.
+func NewPrivateKeyForTest() (NoisePrivateKey, error) { return newPrivateKey() }
+
+// PublicKeyForTest is an exported wrapper for computing a public key.
+func (sk NoisePrivateKey) PublicKeyForTest() NoisePublicKey { return sk.publicKey() }
+
